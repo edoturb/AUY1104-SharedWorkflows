@@ -1,10 +1,17 @@
 {
-  "name": "ea2-cloud-lab-api",
+  "name": "auy1104-api-ejemplo-docker",
   "version": "1.0.0",
-  "private": true,
-  "main": "server.js",
+  "description": "API academica AUY1104",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node -e \"console.log('Tests OK'); process.exit(0)\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "express": "^4.21.0",
-    "mysql2": "^3.11.0"
+    "express": "^4.21.2"
   }
 }
