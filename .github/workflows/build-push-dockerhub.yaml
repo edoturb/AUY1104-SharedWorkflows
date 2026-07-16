@@ -3,6 +3,9 @@ name: Reusable - Build and Push to Docker Hub
 on:
   workflow_call:
     inputs:
+      docker-username:
+        required: true
+        type: string
       image-name:
         required: true
         type: string
@@ -10,8 +13,6 @@ on:
         required: true
         type: string
     secrets:
-      DOCKER_USERNAME:
-        required: true
       DOCKER_PASSWORD:
         required: true
     outputs:
@@ -30,7 +31,7 @@ jobs:
       - name: Login en Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
+          username: ${{ inputs.docker-username }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build y push
@@ -39,9 +40,9 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }}
-            ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:latest
+            ${{ inputs.docker-username }}/${{ inputs.image-name }}:${{ inputs.image-tag }}
+            ${{ inputs.docker-username }}/${{ inputs.image-name }}:latest
 
       - name: Set output
         id: set-output
-        run: echo "image=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }}" >> "$GITHUB_OUTPUT"
+        run: echo "image=${{ inputs.docker-username }}/${{ inputs.image-name }}:${{ inputs.image-tag }}" >> "$GITHUB_OUTPUT"
