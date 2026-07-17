@@ -7,7 +7,7 @@ on:
       namespace: { required: false, type: string, default: default }
       app-name: { required: false, type: string, default: demo-api }
       image-uri: { required: true, type: string }
-      health-path: { required: false, type: string, default: / }
+      health-path: { required: false, type: string, default: /health }
     secrets:
       SSH_PRIVATE_KEY:
         required: true
@@ -22,81 +22,63 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Detectar color activo (con bootstrap)
-        id: detect
+      - name: Generar script remoto
         run: |
-          ACTIVE=$(ssh -o StrictHostKeyChecking=accept-new "${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}" \
-            "sudo k3s kubectl get service ${{ inputs.app-name }}-service -n ${{ inputs.namespace }} -o jsonpath='{.spec.selector.version}' 2>/dev/null || true")
+          cat > remote-deploy.sh << 'SCRIPT'
+          #!/bin/bash
+          set -e
+          APP="$1"
+          NS="$2"
+          IMAGE="$3"
+          HEALTH_PATH="$4"
+
+          ACTIVE=$(sudo k3s kubectl get service ${APP}-service -n ${NS} -o jsonpath='{.spec.selector.version}' 2>/dev/null || true)
           if [ -z "$ACTIVE" ]; then
-            echo "⚠️ Sin color activo previo, asumiendo bootstrap → blue"
             ACTIVE="blue"
           fi
-          [ "$ACTIVE" = "blue" ] && IDLE="green" || IDLE="blue"
-          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
-          echo "idle=$IDLE" >> "$GITHUB_OUTPUT"
-          echo "🔵🟢 Activo=$ACTIVE / Idle=$IDLE"
+          if [ "$ACTIVE" = "blue" ]; then IDLE="green"; else IDLE="blue"; fi
+          echo "Activo=$ACTIVE Idle=$IDLE"
 
-      - name: Desplegar imagen nueva en color idle
-        run: |
-          ssh -o StrictHostKeyChecking=accept-new "${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}" "
-            sudo k3s kubectl set image deployment/${{ inputs.app-name }}-${{ steps.detect.outputs.idle }} \
-              ${{ inputs.app-name }}=${{ inputs.image-uri }} -n ${{ inputs.namespace }} &&
-            sudo k3s kubectl rollout status deployment/${{ inputs.app-name }}-${{ steps.detect.outputs.idle }} \
-              -n ${{ inputs.namespace }} --timeout=90s
-          "
+          sudo k3s kubectl set image deployment/${APP}-${IDLE} ${APP}=${IMAGE} -n ${NS}
+          sudo k3s kubectl rollout status deployment/${APP}-${IDLE} -n ${NS} --timeout=90s
 
-      - name: Validación de salud pre-switch (status + latencia)
-        run: |
-          ssh -o StrictHostKeyChecking=accept-new "${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}" '
-            URL="http://'"${{ inputs.app-name }}"'-'"${{ steps.detect.outputs.idle }}"'-service.'"${{ inputs.namespace }}"'.svc.cluster.local'"${{ inputs.health-path }}"'"
-            for i in 1 2 3 4 5; do
-              RESULT=$(sudo k3s kubectl run health-pre-'"${{ github.run_id }}"' --rm -i --restart=Never \
-                --image=curlimages/curl:8.9.1 -n '"${{ inputs.namespace }}"' -- \
-                curl -s -o /dev/null -w "%{http_code} %{time_total}" --max-time 5 "$URL" 2>/dev/null)
-              CODE=$(echo "$RESULT" | awk "{print \$1}")
-              echo "Intento $i -> $RESULT"
-              if [ "$CODE" = "200" ]; then exit 0; fi
-              sleep 3
-            done
-            echo "Fallo: el color idle no respondio 200 tras 5 intentos"
+          IDLE_IP=$(sudo k3s kubectl get svc ${APP}-${IDLE}-service -n ${NS} -o jsonpath='{.spec.clusterIP}')
+          OK=0
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://${IDLE_IP}${HEALTH_PATH}" || echo "000")
+            echo "Intento $i -> HTTP $CODE"
+            if [ "$CODE" = "200" ]; then OK=1; break; fi
+            sleep 3
+          done
+          if [ "$OK" != "1" ]; then
+            echo "Fallo: color idle no respondio 200, no se movio trafico"
             exit 1
-          '
+          fi
 
-      - name: Cambiar tráfico al color idle (switch atómico)
-        run: |
-          ssh -o StrictHostKeyChecking=accept-new "${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}" "
-            sudo k3s kubectl patch service ${{ inputs.app-name }}-service -n ${{ inputs.namespace }} \
-              -p '{\"spec\":{\"selector\":{\"app\":\"${{ inputs.app-name }}\",\"version\":\"${{ steps.detect.outputs.idle }}\"}}}'
-          "
-          echo "✅ Tráfico movido a ${{ steps.detect.outputs.idle }}"
+          sudo k3s kubectl patch service ${APP}-service -n ${NS} \
+            -p "{\"spec\":{\"selector\":{\"app\":\"${APP}\",\"version\":\"${IDLE}\"}}}"
+          echo "Trafico movido a ${IDLE}"
 
-      - name: Smoke test post-switch
-        run: |
           sleep 5
-          ssh -o StrictHostKeyChecking=accept-new "${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}" "
-            sudo k3s kubectl run health-post-${{ github.run_id }} --rm -i --restart=Never \
-              --image=curlimages/curl:8.9.1 -n ${{ inputs.namespace }} -- \
-              curl -sf --max-time 5 http://${{ inputs.app-name }}-service.${{ inputs.namespace }}.svc.cluster.local${{ inputs.health-path }}
-          "
+          PUB_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://localhost:30080${HEALTH_PATH}" || echo "000")
+          echo "Smoke test post-switch -> HTTP $PUB_CODE"
+          if [ "$PUB_CODE" != "200" ]; then
+            echo "Fallo post-switch, revirtiendo a ${ACTIVE}"
+            sudo k3s kubectl patch service ${APP}-service -n ${NS} \
+              -p "{\"spec\":{\"selector\":{\"app\":\"${APP}\",\"version\":\"${ACTIVE}\"}}}"
+            exit 1
+          fi
 
-      - name: Rollback automático (pre-switch o post-switch)
-        if: failure()
-        run: |
-          echo "🔴 Fallo detectado, revirtiendo a ${{ steps.detect.outputs.active }}"
-          ssh -o StrictHostKeyChecking=accept-new "${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}" "
-            sudo k3s kubectl patch service ${{ inputs.app-name }}-service -n ${{ inputs.namespace }} \
-              -p '{\"spec\":{\"selector\":{\"app\":\"${{ inputs.app-name }}\",\"version\":\"${{ steps.detect.outputs.active }}\"}}}' &&
-            sudo k3s kubectl run health-rollback-${{ github.run_id }} --rm -i --restart=Never \
-              --image=curlimages/curl:8.9.1 -n ${{ inputs.namespace }} -- \
-              curl -sf --max-time 5 http://${{ inputs.app-name }}-service.${{ inputs.namespace }}.svc.cluster.local${{ inputs.health-path }}
-          "
-          echo "✅ Rollback verificado: servicio estable en ${{ steps.detect.outputs.active }}"
-          exit 1
+          echo "DEPLOY_OK color=${IDLE}"
+          SCRIPT
+          chmod +x remote-deploy.sh
 
-      - name: Limpieza de pods de diagnóstico
-        if: always()
+      - name: Copiar script al servidor
         run: |
-          ssh -o StrictHostKeyChecking=accept-new "${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}" "
-            sudo k3s kubectl delete pod -n ${{ inputs.namespace }} -l run=health-pre-${{ github.run_id }} --ignore-not-found --force --grace-period=0 2>/dev/null || true
-            sudo k3s kubectl delete pod -n ${{ inputs.namespace }} -l run=health-post-${{ github.run_id }} --ignore-not-found --force --grace-period=0 2>/dev/null || true
-          "
+          scp -o StrictHostKeyChecking=accept-new remote-deploy.sh \
+            ${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }}:/tmp/remote-deploy.sh
+
+      - name: Ejecutar despliegue Blue-Green remoto
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new ${{ inputs.ssh-user }}@${{ secrets.K3S_SERVER_IP }} \
+            "bash /tmp/remote-deploy.sh '${{ inputs.app-name }}' '${{ inputs.namespace }}' '${{ inputs.image-uri }}' '${{ inputs.health-path }}'"
